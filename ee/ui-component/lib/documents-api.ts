@@ -51,7 +51,7 @@ export async function updateDocumentWithText(
 ): Promise<Document> {
   try {
     let url = `${apiBaseUrl}/documents/${documentId}/update_text`;
-    const queryParams = [];
+    const queryParams: string[] = [];
     
     if (options?.useColpali !== undefined) {
       queryParams.push(`use_colpali=${options.useColpali}`);
@@ -124,7 +124,7 @@ export async function updateDocumentWithFile(
 ): Promise<Document> {
   try {
     let url = `${apiBaseUrl}/documents/${documentId}/update_file`;
-    const queryParams = [];
+    const queryParams: string[] = [];
     
     if (options?.useColpali !== undefined) {
       queryParams.push(`use_colpali=${options.useColpali}`);
