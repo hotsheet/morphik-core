@@ -40,3 +40,6 @@ ee/ui-component/.next
 
 ui-component/notebook-storage/notebooks.json
 ee/ui-component/package-lock.json
+
+*.log
+*.old
