@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # Build stage
-FROM python:3.12.5-slim as builder
+FROM python:3.12.5-slim AS builder
 
 # Set working directory
 WORKDIR /app
