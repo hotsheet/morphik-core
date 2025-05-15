@@ -112,13 +112,10 @@ class UserService:
             return hourly_usage + value <= hourly_limit and monthly_usage + value <= monthly_limit
 
         elif limit_type == "ingest":
-            hourly_limit = tier_limits.get("hourly_ingest_limit", 0)
-            monthly_limit = tier_limits.get("monthly_ingest_limit", 0)
+            total_limit = tier_limits.get("ingest_limit", 0)
+            total_usage = usage.get("ingest_count", 0)
 
-            hourly_usage = usage.get("hourly_ingest_count", 0)
-            monthly_usage = usage.get("monthly_ingest_count", 0)
-
-            return hourly_usage + value <= hourly_limit and monthly_usage + value <= monthly_limit
+            return total_usage + value <= total_limit
 
         elif limit_type == "storage_file":
             file_limit = tier_limits.get("storage_file_limit", 0)
@@ -141,8 +138,15 @@ class UserService:
         elif limit_type == "cache":
             cache_limit = tier_limits.get("cache_creation_limit", 0)
             cache_count = usage.get("cache_count", 0)
-
             return cache_count + value <= cache_limit
+
+        # Agent call limits
+        elif limit_type == "agent":
+            hourly_limit = tier_limits.get("hourly_agent_limit", 0)
+            monthly_limit = tier_limits.get("monthly_agent_limit", 0)
+            hourly_usage = usage.get("hourly_agent_count", 0)
+            monthly_usage = usage.get("monthly_agent_count", 0)
+            return hourly_usage + value <= hourly_limit and monthly_usage + value <= monthly_limit
 
         return True
 

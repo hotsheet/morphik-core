@@ -67,8 +67,9 @@ class UserLimitsDatabase:
                             text(
                                 f"DO $$\n"
                                 f"BEGIN\n"
-                                f"    IF NOT EXISTS (SELECT 1 FROM information_schema.columns \n"
-                                f"                 WHERE table_name='user_limits' AND column_name='{column_name}') THEN\n"
+                                f"    IF NOT EXISTS (SELECT 1 FROM information_schema.columns "
+                                f"                 WHERE table_name='user_limits' "
+                                f"                 AND column_name='{column_name}') THEN\n"
                                 f"        ALTER TABLE user_limits ADD COLUMN {column_name} VARCHAR;\n"
                                 f"    END IF;\n"
                                 f"END$$;"
@@ -147,12 +148,13 @@ class UserLimitsDatabase:
                         "hourly_query_reset": now,
                         "monthly_query_count": 0,
                         "monthly_query_reset": now,
-                        "hourly_ingest_count": 0,
-                        "hourly_ingest_reset": now,
-                        "monthly_ingest_count": 0,
-                        "monthly_ingest_reset": now,
+                        "ingest_count": 0,
                         "graph_count": 0,
                         "cache_count": 0,
+                        "hourly_agent_count": 0,
+                        "hourly_agent_reset": now,
+                        "monthly_agent_count": 0,
+                        "monthly_agent_reset": now,
                     }
                 )
                 app_ids_json = json.dumps([])  # Empty array but as JSON string
@@ -364,30 +366,8 @@ class UserLimitsDatabase:
                         usage["monthly_query_reset"] = now_iso
 
                 elif usage_type == "ingest":
-                    # Similar pattern for ingest
-                    hourly_reset_str = usage.get("hourly_ingest_reset", "")
-                    if hourly_reset_str:
-                        hourly_reset = datetime.fromisoformat(hourly_reset_str)
-                        if now > hourly_reset + timedelta(hours=1):
-                            usage["hourly_ingest_count"] = increment
-                            usage["hourly_ingest_reset"] = now_iso
-                        else:
-                            usage["hourly_ingest_count"] = usage.get("hourly_ingest_count", 0) + increment
-                    else:
-                        usage["hourly_ingest_count"] = increment
-                        usage["hourly_ingest_reset"] = now_iso
-
-                    monthly_reset_str = usage.get("monthly_ingest_reset", "")
-                    if monthly_reset_str:
-                        monthly_reset = datetime.fromisoformat(monthly_reset_str)
-                        if now > monthly_reset + timedelta(days=30):
-                            usage["monthly_ingest_count"] = increment
-                            usage["monthly_ingest_reset"] = now_iso
-                        else:
-                            usage["monthly_ingest_count"] = usage.get("monthly_ingest_count", 0) + increment
-                    else:
-                        usage["monthly_ingest_count"] = increment
-                        usage["monthly_ingest_reset"] = now_iso
+                    # Lifetime counter (no reset)
+                    usage["ingest_count"] = usage.get("ingest_count", 0) + increment
 
                 elif usage_type == "storage_file":
                     usage["storage_file_count"] = usage.get("storage_file_count", 0) + increment
@@ -400,6 +380,34 @@ class UserLimitsDatabase:
 
                 elif usage_type == "cache":
                     usage["cache_count"] = usage.get("cache_count", 0) + increment
+
+                elif usage_type == "agent":
+                    # Agent call limits: hourly and monthly resets
+                    # Hourly reset
+                    hourly_reset_str = usage.get("hourly_agent_reset", "")
+                    if hourly_reset_str:
+                        hourly_reset = datetime.fromisoformat(hourly_reset_str)
+                        if now > hourly_reset + timedelta(hours=1):
+                            usage["hourly_agent_count"] = increment
+                            usage["hourly_agent_reset"] = now_iso
+                        else:
+                            usage["hourly_agent_count"] = usage.get("hourly_agent_count", 0) + increment
+                    else:
+                        usage["hourly_agent_count"] = increment
+                        usage["hourly_agent_reset"] = now_iso
+
+                    # Monthly reset
+                    monthly_reset_str = usage.get("monthly_agent_reset", "")
+                    if monthly_reset_str:
+                        monthly_reset = datetime.fromisoformat(monthly_reset_str)
+                        if now > monthly_reset + timedelta(days=30):
+                            usage["monthly_agent_count"] = increment
+                            usage["monthly_agent_reset"] = now_iso
+                        else:
+                            usage["monthly_agent_count"] = usage.get("monthly_agent_count", 0) + increment
+                    else:
+                        usage["monthly_agent_count"] = increment
+                        usage["monthly_agent_reset"] = now_iso
 
                 # Force SQLAlchemy to recognize the change by assigning a new dict
                 user_limits.usage = usage

@@ -3,31 +3,38 @@ import base64
 import json
 import logging
 import uuid
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import arq
 import jwt
 import tomli
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.cors import CORSMiddleware  # Import CORSMiddleware
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from starlette.middleware.sessions import SessionMiddleware
 
+from core.agent import MorphikAgent
+from core.auth_utils import verify_token
 from core.cache.llama_cache_factory import LlamaCacheFactory
 from core.completion.litellm_completion import LiteLLMCompletionModel
 from core.config import get_settings
 from core.database.postgres_database import PostgresDatabase
+from core.dependencies import get_redis_pool
+from core.embedding.colpali_api_embedding_model import ColpaliApiEmbeddingModel
 from core.embedding.colpali_embedding_model import ColpaliEmbeddingModel
 from core.embedding.litellm_embedding import LiteLLMEmbeddingModel
-from core.limits_utils import check_and_increment_limits
-from core.models.auth import AuthContext, EntityType
+from core.limits_utils import check_and_increment_limits, estimate_pages_by_chars
+from core.models.auth import AuthContext
 from core.models.completion import ChunkSource, CompletionResponse
 from core.models.documents import ChunkResult, Document, DocumentResult
 from core.models.folders import Folder, FolderCreate
 from core.models.graph import Graph
 from core.models.prompts import validate_prompt_overrides_with_http_exception
 from core.models.request import (
+    AgentQueryRequest,
     BatchIngestResponse,
     CompletionQueryRequest,
     CreateGraphRequest,
@@ -47,31 +54,82 @@ from core.vector_store.multi_vector_store import MultiVectorStore
 from core.vector_store.pgvector_store import PGVectorStore
 
 # Initialize FastAPI app
-app = FastAPI(title="Morphik API")
 logger = logging.getLogger(__name__)
 
-
-# Add health check endpoints
-@app.get("/health")
-async def health_check():
-    """Basic health check endpoint."""
-    return {"status": "healthy"}
+# Global variable for redis_pool, primarily for shutdown if app.state access fails.
+_global_redis_pool: Optional[arq.ArqRedis] = None
 
 
-@app.get("/health/ready")
-async def readiness_check():
-    """Readiness check that verifies the application is initialized."""
-    return {
-        "status": "ready",
-        "components": {
-            "database": settings.DATABASE_PROVIDER,
-            "vector_store": settings.VECTOR_STORE_PROVIDER,
-            "embedding": settings.EMBEDDING_PROVIDER,
-            "completion": settings.COMPLETION_PROVIDER,
-            "storage": settings.STORAGE_PROVIDER,
-        },
-    }
+@asynccontextmanager
+async def lifespan(app_instance: FastAPI):
+    # --- BEGIN MOVED STARTUP LOGIC ---
+    logger.info("Lifespan: Initializing Database...")
+    try:
+        success = await database.initialize()
+        if success:
+            logger.info("Lifespan: Database initialization successful")
+        else:
+            logger.error("Lifespan: Database initialization failed")
+    except Exception as e:
+        logger.error(f"Lifespan: CRITICAL - Failed to initialize Database: {e}", exc_info=True)
+        raise  # Or handle more gracefully if appropriate
 
+    logger.info("Lifespan: Initializing Vector Store...")
+    try:
+        global vector_store
+        if hasattr(vector_store, "initialize"):
+            await vector_store.initialize()
+        logger.info("Lifespan: Vector Store initialization successful (or not applicable).")
+    except Exception as e:
+        logger.error(f"Lifespan: CRITICAL - Failed to initialize Vector Store: {e}", exc_info=True)
+        # Decide if this is fatal
+        # raise
+
+    logger.info("Lifespan: Attempting to initialize Redis connection pool...")
+    global _global_redis_pool  # Ensure we're using the global for assignment
+    try:
+        redis_settings_obj = arq.connections.RedisSettings(
+            host=settings.REDIS_HOST,
+            port=settings.REDIS_PORT,
+        )
+        logger.info(f"Lifespan: Redis settings for pool: host={settings.REDIS_HOST}, port={settings.REDIS_PORT}")
+        current_redis_pool = await arq.create_pool(redis_settings_obj)
+        if current_redis_pool:
+            app_instance.state.redis_pool = current_redis_pool  # Use app_instance from lifespan
+            _global_redis_pool = current_redis_pool
+            logger.info("Lifespan: Successfully initialized Redis connection pool and stored on app.state.")
+        else:
+            logger.error("Lifespan: arq.create_pool returned None or a falsey value for Redis pool.")
+            raise RuntimeError("Lifespan: Failed to create Redis pool - arq.create_pool returned non-truthy value.")
+    except Exception as e:
+        logger.error(f"Lifespan: CRITICAL - Failed to initialize Redis connection pool: {e}", exc_info=True)
+        raise RuntimeError(f"Lifespan: CRITICAL - Failed to initialize Redis connection pool: {e}") from e
+    # --- END MOVED STARTUP LOGIC ---
+
+    logger.info("Lifespan: Core startup logic executed.")
+    yield
+    # Shutdown logic
+    logger.info("Lifespan: Shutdown initiated.")
+    # Use app_instance.state to get the pool for shutdown too
+    pool_to_close = getattr(app_instance.state, "redis_pool", _global_redis_pool)
+    if pool_to_close:
+        logger.info("Closing Redis connection pool from lifespan...")
+        pool_to_close.close()
+        # await pool_to_close.wait_closed()
+        logger.info("Redis connection pool closed from lifespan.")
+    logger.info("Lifespan: Shutdown complete.")
+
+
+app = FastAPI(lifespan=lifespan)
+
+# Add CORSMiddleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows all origins
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows all methods
+    allow_headers=["*"],  # Allows all headers
+)
 
 # Initialize telemetry
 telemetry = TelemetryService()
@@ -86,111 +144,30 @@ FastAPIInstrumentor.instrument_app(
     tracer_provider=None,  # Use the global tracer provider
 )
 
-# Add CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 # Initialize service
 settings = get_settings()
+
+# ---------------------------------------------------------------------------
+# Session cookie settings
+#   • Self-hosted / local dev  → default Starlette behaviour (SameSite=Lax)
+#   • Cloud (separate frontend & api domains) → SameSite=None; Secure so the
+#     browser will include the cookie in cross-site requests (e.g. api ↔ www).
+# ---------------------------------------------------------------------------
+
+if settings.MODE == "cloud":
+    app.add_middleware(
+        SessionMiddleware,
+        secret_key=settings.SESSION_SECRET_KEY,
+        same_site="none",  # Allow cross-site requests
+        https_only=True,  # Cookie is Secure (required when SameSite=None)
+    )
+else:
+    app.add_middleware(SessionMiddleware, secret_key=settings.SESSION_SECRET_KEY)
 
 # Initialize database
 if not settings.POSTGRES_URI:
     raise ValueError("PostgreSQL URI is required for PostgreSQL database")
 database = PostgresDatabase(uri=settings.POSTGRES_URI)
-
-# Redis settings already imported at top of file
-
-
-@app.on_event("startup")
-async def initialize_database():
-    """Initialize database tables and indexes on application startup."""
-    logger.info("Initializing database...")
-    success = await database.initialize()
-    if success:
-        logger.info("Database initialization successful")
-    else:
-        logger.error("Database initialization failed")
-        # We don't raise an exception here to allow the app to continue starting
-        # even if there are initialization errors
-
-
-@app.on_event("startup")
-async def initialize_vector_store():
-    """Initialize vector store tables and indexes on application startup."""
-    # First initialize the primary vector store (PGVectorStore if using pgvector)
-    logger.info("Initializing primary vector store...")
-    if hasattr(vector_store, "initialize"):
-        success = await vector_store.initialize()
-        if success:
-            logger.info("Primary vector store initialization successful")
-        else:
-            logger.error("Primary vector store initialization failed")
-    else:
-        logger.warning("Primary vector store does not have an initialize method")
-
-    # Then initialize the multivector store if enabled
-    if settings.ENABLE_COLPALI and colpali_vector_store:
-        logger.info("Initializing multivector store...")
-        # Handle both synchronous and asynchronous initialize methods
-        if hasattr(colpali_vector_store.initialize, "__awaitable__"):
-            success = await colpali_vector_store.initialize()
-        else:
-            success = colpali_vector_store.initialize()
-
-        if success:
-            logger.info("Multivector store initialization successful")
-        else:
-            logger.error("Multivector store initialization failed")
-
-
-@app.on_event("startup")
-async def initialize_user_limits_database():
-    """Initialize user service on application startup."""
-    logger.info("Initializing user service...")
-    if settings.MODE == "cloud":
-        from core.database.user_limits_db import UserLimitsDatabase
-
-        user_limits_db = UserLimitsDatabase(uri=settings.POSTGRES_URI)
-        await user_limits_db.initialize()
-
-
-@app.on_event("startup")
-async def initialize_redis_pool():
-    """Initialize the Redis connection pool for background tasks."""
-    global redis_pool
-    logger.info("Initializing Redis connection pool...")
-
-    # Get Redis settings from configuration
-    redis_host = settings.REDIS_HOST
-    redis_port = settings.REDIS_PORT
-
-    # Log the Redis connection details
-    logger.info(f"Connecting to Redis at {redis_host}:{redis_port}")
-
-    redis_settings = arq.connections.RedisSettings(
-        host=redis_host,
-        port=redis_port,
-    )
-
-    redis_pool = await arq.create_pool(redis_settings)
-    logger.info("Redis connection pool initialized successfully")
-
-
-@app.on_event("shutdown")
-async def close_redis_pool():
-    """Close the Redis connection pool on application shutdown."""
-    global redis_pool
-    if redis_pool:
-        logger.info("Closing Redis connection pool...")
-        redis_pool.close()
-        await redis_pool.wait_closed()
-        logger.info("Redis connection pool closed")
-
 
 # Initialize vector store
 if not settings.POSTGRES_URI:
@@ -259,68 +236,59 @@ if settings.USE_RERANKING:
 # Initialize cache factory
 cache_factory = LlamaCacheFactory(Path(settings.STORAGE_PATH))
 
-# Initialize ColPali embedding model if enabled
-colpali_embedding_model = ColpaliEmbeddingModel() if settings.ENABLE_COLPALI else None
-colpali_vector_store = MultiVectorStore(uri=settings.POSTGRES_URI) if settings.ENABLE_COLPALI else None
+# Initialize ColPali embedding model per mode (off/local/api)
+match settings.COLPALI_MODE:
+    case "off":
+        colpali_embedding_model = None
+        colpali_vector_store = None
+    case "local":
+        colpali_embedding_model = ColpaliEmbeddingModel()
+        colpali_vector_store = MultiVectorStore(uri=settings.POSTGRES_URI)
+    case "api":
+        colpali_embedding_model = ColpaliApiEmbeddingModel()
+        colpali_vector_store = MultiVectorStore(uri=settings.POSTGRES_URI)
+    case _:
+        raise ValueError(f"Unsupported COLPALI_MODE: {settings.COLPALI_MODE}")
 
 # Initialize document service with configured components
 document_service = DocumentService(
-    storage=storage,
     database=database,
     vector_store=vector_store,
+    storage=storage,
+    parser=parser,
     embedding_model=embedding_model,
     completion_model=completion_model,
-    parser=parser,
-    reranker=reranker,
     cache_factory=cache_factory,
+    reranker=reranker,
     enable_colpali=settings.ENABLE_COLPALI,
     colpali_embedding_model=colpali_embedding_model,
     colpali_vector_store=colpali_vector_store,
 )
+# Store document_service on app.state immediately after it's created.
+# This must happen before _init_ee_app(app) is called.
+app.state.document_service = document_service
+logger.info("Document service initialized and stored on app.state")
 
+# Initialize the MorphikAgent once to load tool definitions and avoid repeated I/O
+morphik_agent = MorphikAgent(document_service=document_service)
 
-async def verify_token(authorization: str = Header(None)) -> AuthContext:
-    """Verify JWT Bearer token or return dev context if dev_mode is enabled."""
-    # Check if dev mode is enabled
-    if settings.dev_mode:
-        return AuthContext(
-            entity_type=EntityType(settings.dev_entity_type),
-            entity_id=settings.dev_entity_id,
-            permissions=set(settings.dev_permissions),
-            user_id=settings.dev_entity_id,  # In dev mode, entity_id is also the user_id
-        )
+# ---------------------------------------------------------------------------
+# Mount enterprise-only routes when the proprietary ``ee`` package
+# is present.
+# ---------------------------------------------------------------------------
 
-    # Normal token verification flow
-    if not authorization:
-        raise HTTPException(
-            status_code=401,
-            detail="Missing authorization header",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    try:
-        if not authorization.startswith("Bearer "):
-            raise HTTPException(status_code=401, detail="Invalid authorization header")
+try:
+    from ee.routers import init_app as _init_ee_app  # type: ignore
 
-        token = authorization[7:]  # Remove "Bearer "
-        payload = jwt.decode(token, settings.JWT_SECRET_KEY, algorithms=[settings.JWT_ALGORITHM])
-
-        if datetime.fromtimestamp(payload["exp"], UTC) < datetime.now(UTC):
-            raise HTTPException(status_code=401, detail="Token expired")
-
-        # Support both "type" and "entity_type" fields for compatibility
-        entity_type_field = payload.get("type") or payload.get("entity_type")
-        if not entity_type_field:
-            raise HTTPException(status_code=401, detail="Missing entity type in token")
-
-        return AuthContext(
-            entity_type=EntityType(entity_type_field),
-            entity_id=payload["entity_id"],
-            app_id=payload.get("app_id"),
-            permissions=set(payload.get("permissions", ["read"])),
-            user_id=payload.get("user_id", payload["entity_id"]),  # Use user_id if available, fallback to entity_id
-        )
-    except jwt.InvalidTokenError as e:
-        raise HTTPException(status_code=401, detail=str(e))
+    _init_ee_app(app)  # noqa: SLF001 – runtime extension
+except ModuleNotFoundError as e:
+    # Expected in OSS builds – silently ignore.
+    logger.debug("Enterprise package not found – running in community mode.")
+    logger.error(f"ModuleNotFoundError: {e}", exc_info=True)
+except ImportError as e:
+    logger.error(f"Failed to import init_app from ee.routers: {e}", exc_info=True)
+except Exception as e:
+    logger.error(f"An unexpected error occurred during EE app initialization: {e}", exc_info=True)
 
 
 @app.post("/ingest/text", response_model=Document)
@@ -348,6 +316,17 @@ async def ingest_text(
         Document: Metadata of ingested document
     """
     try:
+        # Verify limits before processing - this will call the function from limits_utils
+        if settings.MODE == "cloud" and auth.user_id:
+            num_pages_estimated = estimate_pages_by_chars(len(request.content))
+            await check_and_increment_limits(
+                auth,
+                "ingest",
+                num_pages_estimated,
+                verify_only=True,  # This initial check in API remains verify_only=True
+                # Final recording will be done in DocumentService.ingest_text
+            )
+
         return await document_service.ingest_text(
             content=request.content,
             filename=request.filename,
@@ -360,15 +339,6 @@ async def ingest_text(
         )
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e))
-
-
-# Redis pool for background tasks
-redis_pool = None
-
-
-def get_redis_pool():
-    """Get the global Redis connection pool for background tasks."""
-    return redis_pool
 
 
 @app.post("/ingest/file", response_model=Document)
@@ -410,13 +380,13 @@ async def ingest_file(
         def str2bool(v):
             return v if isinstance(v, bool) else str(v).lower() in {"true", "1", "yes"}
 
-        use_colpali = str2bool(use_colpali)
+        use_colpali_bool = str2bool(use_colpali)  # Renamed to avoid conflict
 
         # Ensure user has write permission
         if "write" not in auth.permissions:
             raise PermissionError("User does not have write permission")
 
-        logger.debug(f"API: Queueing file ingestion with use_colpali: {use_colpali}")
+        logger.debug(f"API: Queueing file ingestion with use_colpali: {use_colpali_bool}")
 
         # Create a document with processing status
         doc = Document(
@@ -428,7 +398,8 @@ async def ingest_file(
                 "readers": [auth.entity_id],
                 "writers": [auth.entity_id],
                 "admins": [auth.entity_id],
-                "user_id": [auth.user_id] if auth.user_id else [],
+                "user_id": [auth.user_id if auth.user_id else []],
+                "app_access": ([auth.app_id] if auth.app_id else []),
             },
             system_metadata={"status": "processing"},
         )
@@ -438,12 +409,20 @@ async def ingest_file(
             doc.system_metadata["folder_name"] = folder_name
         if end_user_id:
             doc.system_metadata["end_user_id"] = end_user_id
+        if auth.app_id:
+            doc.system_metadata["app_id"] = auth.app_id
 
         # Set processing status
         doc.system_metadata["status"] = "processing"
 
-        # Store the document in the database
-        success = await database.store_document(doc)
+        # Store the document in the *per-app* database that verify_token has
+        # already routed to (document_service.db).  Using the global
+        # *database* here would put the row into the control-plane DB and the
+        # ingestion worker – which connects to the per-app DB – would never
+        # find it.
+        app_db = document_service.db
+
+        success = await app_db.store_document(doc)
         if not success:
             raise Exception("Failed to store document metadata")
 
@@ -459,12 +438,29 @@ async def ingest_file(
         # Read file content
         file_content = await file.read()
 
+        # --------------------------------------------
+        # Enforce storage limits (file & size) early
+        # This check remains verify_only=True here, final recording in worker.
+        # --------------------------------------------
+        if settings.MODE == "cloud" and auth.user_id:
+            await check_and_increment_limits(auth, "storage_file", 1, verify_only=True)
+            await check_and_increment_limits(auth, "storage_size", len(file_content), verify_only=True)
+            # Ingest limit pre-check will be done in the worker after parsing.
+
         # Generate a unique key for the file
         file_key = f"ingest_uploads/{uuid.uuid4()}/{file.filename}"
 
-        # Store the file in the configured storage
+        # Store the file in the dedicated bucket for this app (if any)
         file_content_base64 = base64.b64encode(file_content).decode()
-        bucket, stored_key = await storage.upload_from_base64(file_content_base64, file_key, file.content_type)
+
+        bucket_override = await document_service._get_bucket_for_app(auth.app_id)
+
+        bucket, stored_key = await storage.upload_from_base64(
+            file_content_base64,
+            file_key,
+            file.content_type,
+            bucket=bucket_override or "",
+        )
         logger.debug(f"Stored file in bucket {bucket} with key {stored_key}")
 
         # Update document with storage info
@@ -490,11 +486,21 @@ async def ingest_file(
         logger.debug(f"Initial storage_files for {doc.external_id}: {doc.storage_files}")
 
         # Update both storage_info and storage_files
-        await database.update_document(
+        await app_db.update_document(
             document_id=doc.external_id,
             updates={"storage_info": doc.storage_info, "storage_files": doc.storage_files},
             auth=auth,
         )
+
+        # ------------------------------------------------------------------
+        # Record storage usage now that the upload succeeded (cloud mode)
+        # ------------------------------------------------------------------
+        if settings.MODE == "cloud" and auth.user_id:
+            try:
+                await check_and_increment_limits(auth, "storage_file", 1)
+                await check_and_increment_limits(auth, "storage_size", len(file_content))
+            except Exception as rec_exc:  # noqa: BLE001
+                logger.error("Failed to record storage usage in ingest_file: %s", rec_exc)
 
         # Convert auth context to a dictionary for serialization
         auth_dict = {
@@ -516,7 +522,7 @@ async def ingest_file(
             metadata_json=metadata,
             auth_dict=auth_dict,
             rules_list=rules_list,
-            use_colpali=use_colpali,
+            use_colpali=use_colpali_bool,  # Pass the boolean
             folder_name=folder_name,
             end_user_id=end_user_id,
         )
@@ -539,7 +545,7 @@ async def batch_ingest_files(
     files: List[UploadFile] = File(...),
     metadata: str = Form("{}"),
     rules: str = Form("[]"),
-    use_colpali: Optional[bool] = Form(None),
+    use_colpali: Optional[bool] = Form(None),  # Keep Optional[bool] for Form
     parallel: Optional[bool] = Form(True),
     folder_name: Optional[str] = Form(None),
     end_user_id: Optional[str] = Form(None),
@@ -577,7 +583,7 @@ async def batch_ingest_files(
         def str2bool(v):
             return str(v).lower() in {"true", "1", "yes"}
 
-        use_colpali = str2bool(use_colpali)
+        use_colpali_bool = str2bool(use_colpali)  # Renamed for clarity
 
         # Ensure user has write permission
         if "write" not in auth.permissions:
@@ -634,6 +640,7 @@ async def batch_ingest_files(
                     "writers": [auth.entity_id],
                     "admins": [auth.entity_id],
                     "user_id": [auth.user_id] if auth.user_id else [],
+                    "app_access": ([auth.app_id] if auth.app_id else []),
                 },
             )
 
@@ -642,12 +649,20 @@ async def batch_ingest_files(
                 doc.system_metadata["folder_name"] = folder_name
             if end_user_id:
                 doc.system_metadata["end_user_id"] = end_user_id
+            if auth.app_id:
+                doc.system_metadata["app_id"] = auth.app_id
 
             # Set processing status
             doc.system_metadata["status"] = "processing"
 
-            # Store the document in the database
-            success = await database.store_document(doc)
+            # Store the document in the *per-app* database that verify_token has
+            # already routed to (document_service.db).  Using the global
+            # *database* here would put the row into the control-plane DB and the
+            # ingestion worker – which connects to the per-app DB – would never
+            # find it.
+            app_db = document_service.db
+
+            success = await app_db.store_document(doc)
             if not success:
                 raise Exception(f"Failed to store document metadata for {file.filename}")
 
@@ -663,19 +678,46 @@ async def batch_ingest_files(
             # Read file content
             file_content = await file.read()
 
+            # --------------------------------------------
+            # Enforce storage limits (file & size) early
+            # This check remains verify_only=True here.
+            # --------------------------------------------
+            if settings.MODE == "cloud" and auth.user_id:
+                await check_and_increment_limits(auth, "storage_file", 1, verify_only=True)
+                await check_and_increment_limits(auth, "storage_size", len(file_content), verify_only=True)
+                # Ingest limit pre-check will be done in the worker after parsing for each file.
+
             # Generate a unique key for the file
             file_key = f"ingest_uploads/{uuid.uuid4()}/{file.filename}"
 
-            # Store the file in the configured storage
+            # Store the file in the dedicated bucket for this app (if any)
             file_content_base64 = base64.b64encode(file_content).decode()
-            bucket, stored_key = await storage.upload_from_base64(file_content_base64, file_key, file.content_type)
+
+            bucket_override = await document_service._get_bucket_for_app(auth.app_id)
+
+            bucket, stored_key = await storage.upload_from_base64(
+                file_content_base64,
+                file_key,
+                file.content_type,
+                bucket=bucket_override or "",
+            )
             logger.debug(f"Stored file in bucket {bucket} with key {stored_key}")
 
             # Update document with storage info
             doc.storage_info = {"bucket": bucket, "key": stored_key}
-            await database.update_document(
+            await app_db.update_document(
                 document_id=doc.external_id, updates={"storage_info": doc.storage_info}, auth=auth
             )
+
+            # ------------------------------------------------------------------
+            # Record storage usage now that the upload succeeded (cloud mode)
+            # ------------------------------------------------------------------
+            if settings.MODE == "cloud" and auth.user_id:
+                try:
+                    await check_and_increment_limits(auth, "storage_file", 1)
+                    await check_and_increment_limits(auth, "storage_size", len(file_content))
+                except Exception as rec_exc:  # noqa: BLE001
+                    logger.error("Failed to record storage usage in ingest_file: %s", rec_exc)
 
             # Convert metadata to JSON string for job
             metadata_json = json.dumps(metadata_item)
@@ -691,7 +733,7 @@ async def batch_ingest_files(
                 metadata_json=metadata_json,
                 auth_dict=auth_dict,
                 rules_list=file_rules,
-                use_colpali=use_colpali,
+                use_colpali=use_colpali_bool,  # Pass the boolean
                 folder_name=folder_name,
                 end_user_id=end_user_id,
             )
@@ -808,6 +850,15 @@ async def batch_get_documents(request: Dict[str, Any], auth: AuthContext = Depen
         if not document_ids:
             return []
 
+        # Create system filters for folder and user scoping
+        system_filters = {}
+        if folder_name:
+            system_filters["folder_name"] = folder_name
+        if end_user_id:
+            system_filters["end_user_id"] = end_user_id
+        if auth.app_id:
+            system_filters["app_id"] = auth.app_id
+
         return await document_service.batch_retrieve_documents(document_ids, auth, folder_name, end_user_id)
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e))
@@ -846,6 +897,15 @@ async def batch_get_chunks(request: Dict[str, Any], auth: AuthContext = Depends(
                 chunk_sources.append(ChunkSource(**source))
             else:
                 chunk_sources.append(source)
+
+        # Create system filters for folder and user scoping
+        system_filters = {}
+        if folder_name:
+            system_filters["folder_name"] = folder_name
+        if end_user_id:
+            system_filters["end_user_id"] = end_user_id
+        if auth.app_id:
+            system_filters["app_id"] = auth.app_id
 
         return await document_service.batch_retrieve_chunks(chunk_sources, auth, folder_name, end_user_id, use_colpali)
     except PermissionError as e:
@@ -917,13 +977,28 @@ async def query_completion(request: CompletionQueryRequest, auth: AuthContext = 
         raise HTTPException(status_code=403, detail=str(e))
 
 
+@app.post("/agent", response_model=Dict[str, Any])
+@telemetry.track(operation_type="agent_query")
+async def agent_query(request: AgentQueryRequest, auth: AuthContext = Depends(verify_token)):
+    """
+    Process a natural language query using the MorphikAgent and return the response.
+    """
+    # Check free-tier agent call limits in cloud mode
+    if settings.MODE == "cloud" and auth.user_id:
+        await check_and_increment_limits(auth, "agent", 1)
+    # Use the shared MorphikAgent instance; per-run state is now isolated internally
+    response = await morphik_agent.run(request.query, auth)
+    # Return the complete response dictionary
+    return response
+
+
 @app.post("/documents", response_model=List[Document])
 async def list_documents(
     auth: AuthContext = Depends(verify_token),
     skip: int = 0,
     limit: int = 10000,
     filters: Optional[Dict[str, Any]] = None,
-    folder_name: Optional[str] = None,
+    folder_name: Optional[Union[str, List[str]]] = None,
     end_user_id: Optional[str] = None,
 ):
     """
@@ -946,6 +1021,8 @@ async def list_documents(
         system_filters["folder_name"] = folder_name
     if end_user_id:
         system_filters["end_user_id"] = end_user_id
+    if auth.app_id:
+        system_filters["app_id"] = auth.app_id
 
     return await document_service.db.get_documents(auth, skip, limit, filters, system_filters)
 
@@ -1035,7 +1112,7 @@ async def delete_document(document_id: str, auth: AuthContext = Depends(verify_t
 async def get_document_by_filename(
     filename: str,
     auth: AuthContext = Depends(verify_token),
-    folder_name: Optional[str] = None,
+    folder_name: Optional[Union[str, List[str]]] = None,
     end_user_id: Optional[str] = None,
 ):
     """
@@ -1343,49 +1420,102 @@ async def create_graph(
     auth: AuthContext = Depends(verify_token),
 ) -> Graph:
     """
-    Create a graph from documents.
+    Create a graph from documents **asynchronously**.
 
-    This endpoint extracts entities and relationships from documents
-    matching the specified filters or document IDs and creates a graph.
-
-    Args:
-        request: CreateGraphRequest containing:
-            - name: Name of the graph to create
-            - filters: Optional metadata filters to determine which documents to include
-            - documents: Optional list of specific document IDs to include
-            - prompt_overrides: Optional customizations for entity extraction and resolution prompts
-            - folder_name: Optional folder to scope the operation to
-            - end_user_id: Optional end-user ID to scope the operation to
-        auth: Authentication context
-
-    Returns:
-        Graph: The created graph object
+    Instead of blocking on the potentially slow entity/relationship extraction, we immediately
+    create a placeholder graph with `status = "processing"`. A background task then fills in
+    entities/relationships and marks the graph as completed.
     """
     try:
         # Validate prompt overrides before proceeding
         if request.prompt_overrides:
             validate_prompt_overrides_with_http_exception(request.prompt_overrides, operation_type="graph")
 
-        # Check graph creation limits if in cloud mode
+        # Enforce usage limits (cloud mode)
         if settings.MODE == "cloud" and auth.user_id:
-            # Check limits before proceeding
             await check_and_increment_limits(auth, "graph", 1)
 
-        # Create system filters for folder and user scoping
-        system_filters = {}
+        # --------------------
+        # Build system filters
+        # --------------------
+        system_filters: Dict[str, Any] = {}
         if request.folder_name:
             system_filters["folder_name"] = request.folder_name
         if request.end_user_id:
             system_filters["end_user_id"] = request.end_user_id
 
-        return await document_service.create_graph(
+        # --------------------
+        # Create stub graph
+        # --------------------
+        import uuid
+        from datetime import UTC, datetime
+
+        from core.models.graph import Graph
+
+        access_control = {
+            "readers": [auth.entity_id],
+            "writers": [auth.entity_id],
+            "admins": [auth.entity_id],
+        }
+        if auth.user_id:
+            access_control["user_id"] = [auth.user_id]
+
+        graph_stub = Graph(
+            id=str(uuid.uuid4()),
             name=request.name,
-            auth=auth,
             filters=request.filters,
-            documents=request.documents,
-            prompt_overrides=request.prompt_overrides,
-            system_filters=system_filters,
+            owner={"type": auth.entity_type.value, "id": auth.entity_id},
+            access_control=access_control,
         )
+
+        # Persist scoping info in system metadata
+        if system_filters.get("folder_name"):
+            graph_stub.system_metadata["folder_name"] = system_filters["folder_name"]
+        if system_filters.get("end_user_id"):
+            graph_stub.system_metadata["end_user_id"] = system_filters["end_user_id"]
+        if auth.app_id:
+            graph_stub.system_metadata["app_id"] = auth.app_id
+
+        # Mark graph as processing
+        graph_stub.system_metadata["status"] = "processing"
+        graph_stub.system_metadata["created_at"] = datetime.now(UTC)
+        graph_stub.system_metadata["updated_at"] = datetime.now(UTC)
+
+        # Store the stub graph so clients can poll for status
+        success = await document_service.db.store_graph(graph_stub)
+        if not success:
+            raise HTTPException(status_code=500, detail="Failed to create graph stub")
+
+        # --------------------
+        # Background processing
+        # --------------------
+        async def _build_graph_async():
+            try:
+                await document_service.update_graph(
+                    name=request.name,
+                    auth=auth,
+                    additional_filters=None,  # original filters already on stub
+                    additional_documents=request.documents,
+                    prompt_overrides=request.prompt_overrides,
+                    system_filters=system_filters,
+                    is_initial_build=True,  # Indicate this is the initial build
+                )
+            except Exception as e:
+                logger.error(f"Graph creation failed for {request.name}: {e}")
+                # Update graph status to failed
+                existing = await document_service.db.get_graph(request.name, auth, system_filters=system_filters)
+                if existing:
+                    existing.system_metadata["status"] = "failed"
+                    existing.system_metadata["error"] = str(e)
+                    existing.system_metadata["updated_at"] = datetime.now(UTC)
+                    await document_service.db.update_graph(existing)
+
+        import asyncio
+
+        asyncio.create_task(_build_graph_async())
+
+        # Return the stub graph immediately
+        return graph_stub
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e))
     except ValueError as e:
@@ -1393,6 +1523,7 @@ async def create_graph(
 
 
 @app.post("/folders", response_model=Folder)
+@telemetry.track(operation_type="create_folder", metadata_resolver=telemetry.create_folder_metadata)
 async def create_folder(
     folder_create: FolderCreate,
     auth: AuthContext = Depends(verify_token),
@@ -1408,54 +1539,52 @@ async def create_folder(
         Folder: Created folder
     """
     try:
-        async with telemetry.track_operation(
-            operation_type="create_folder",
-            user_id=auth.entity_id,
-            metadata={
-                "name": folder_create.name,
+        # Create a folder object with explicit ID
+        import uuid
+
+        folder_id = str(uuid.uuid4())
+        logger.info(f"Creating folder with ID: {folder_id}, auth.user_id: {auth.user_id}")
+
+        # Set up access control with user_id
+        access_control = {
+            "readers": [auth.entity_id],
+            "writers": [auth.entity_id],
+            "admins": [auth.entity_id],
+        }
+
+        if auth.user_id:
+            access_control["user_id"] = [auth.user_id]
+            logger.info(f"Adding user_id {auth.user_id} to folder access control")
+
+        folder = Folder(
+            id=folder_id,
+            name=folder_create.name,
+            description=folder_create.description,
+            owner={
+                "type": auth.entity_type.value,
+                "id": auth.entity_id,
             },
-        ):
-            # Create a folder object with explicit ID
-            import uuid
+            access_control=access_control,
+        )
 
-            folder_id = str(uuid.uuid4())
-            logger.info(f"Creating folder with ID: {folder_id}, auth.user_id: {auth.user_id}")
+        # Scope folder to the application ID for developer tokens
+        if auth.app_id:
+            folder.system_metadata["app_id"] = auth.app_id
 
-            # Set up access control with user_id
-            access_control = {
-                "readers": [auth.entity_id],
-                "writers": [auth.entity_id],
-                "admins": [auth.entity_id],
-            }
+        # Store in database
+        success = await document_service.db.create_folder(folder)
 
-            if auth.user_id:
-                access_control["user_id"] = [auth.user_id]
-                logger.info(f"Adding user_id {auth.user_id} to folder access control")
+        if not success:
+            raise HTTPException(status_code=500, detail="Failed to create folder")
 
-            folder = Folder(
-                id=folder_id,
-                name=folder_create.name,
-                description=folder_create.description,
-                owner={
-                    "type": auth.entity_type.value,
-                    "id": auth.entity_id,
-                },
-                access_control=access_control,
-            )
-
-            # Store in database
-            success = await document_service.db.create_folder(folder)
-
-            if not success:
-                raise HTTPException(status_code=500, detail="Failed to create folder")
-
-            return folder
+        return folder
     except Exception as e:
         logger.error(f"Error creating folder: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/folders", response_model=List[Folder])
+@telemetry.track(operation_type="list_folders", metadata_resolver=telemetry.list_folders_metadata)
 async def list_folders(
     auth: AuthContext = Depends(verify_token),
 ) -> List[Folder]:
@@ -1469,18 +1598,15 @@ async def list_folders(
         List[Folder]: List of folders
     """
     try:
-        async with telemetry.track_operation(
-            operation_type="list_folders",
-            user_id=auth.entity_id,
-        ):
-            folders = await document_service.db.list_folders(auth)
-            return folders
+        folders = await document_service.db.list_folders(auth)
+        return folders
     except Exception as e:
         logger.error(f"Error listing folders: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/folders/{folder_id}", response_model=Folder)
+@telemetry.track(operation_type="get_folder", metadata_resolver=telemetry.get_folder_metadata)
 async def get_folder(
     folder_id: str,
     auth: AuthContext = Depends(verify_token),
@@ -1496,19 +1622,12 @@ async def get_folder(
         Folder: Folder if found and accessible
     """
     try:
-        async with telemetry.track_operation(
-            operation_type="get_folder",
-            user_id=auth.entity_id,
-            metadata={
-                "folder_id": folder_id,
-            },
-        ):
-            folder = await document_service.db.get_folder(folder_id, auth)
+        folder = await document_service.db.get_folder(folder_id, auth)
 
-            if not folder:
-                raise HTTPException(status_code=404, detail=f"Folder {folder_id} not found")
+        if not folder:
+            raise HTTPException(status_code=404, detail=f"Folder {folder_id} not found")
 
-            return folder
+        return folder
     except HTTPException:
         raise
     except Exception as e:
@@ -1516,7 +1635,63 @@ async def get_folder(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.delete("/folders/{folder_name}")
+@telemetry.track(operation_type="delete_folder", metadata_resolver=telemetry.delete_folder_metadata)
+async def delete_folder(
+    folder_name: str,
+    auth: AuthContext = Depends(verify_token),
+):
+    """
+    Delete a folder and all associated documents.
+
+    Args:
+        folder_name: Name of the folder to delete
+        auth: Authentication context (must have write access to the folder)
+
+    Returns:
+        Deletion status
+    """
+    try:
+        folder = await document_service.db.get_folder_by_name(folder_name, auth)
+        folder_id = folder.id
+        if not folder:
+            raise HTTPException(status_code=404, detail="Folder not found")
+
+        document_ids = folder.document_ids
+        tasks = [remove_document_from_folder(folder_id, document_id, auth) for document_id in document_ids]
+        results = await asyncio.gather(*tasks)
+        stati = [res.get("status", False) for res in results]
+        if not all(stati):
+            failed = [doc for doc, stat in zip(document_ids, stati) if not stat]
+            msg = "Failed to remove the following documents from folder: " + ", ".join(failed)
+            logger.error(msg)
+            raise HTTPException(status_code=500, detail=msg)
+
+        # folder is empty now
+        delete_tasks = [document_service.db.delete_document(document_id, auth) for document_id in document_ids]
+        stati = await asyncio.gather(*delete_tasks)
+        if not all(stati):
+            failed = [doc for doc, stat in zip(document_ids, stati) if not stat]
+            msg = "Failed to delete the following documents: " + ", ".join(failed)
+            logger.error(msg)
+            raise HTTPException(status_code=500, detail=msg)
+
+        db: PostgresDatabase = document_service.db
+        # just remove the folder too now.
+        status = await db.delete_folder(folder_id, auth)
+        if not status:
+            logger.error(f"Failed to delete folder {folder_id}")
+            raise HTTPException(status_code=500, detail=f"Failed to delete folder {folder_id}")
+        return {"status": "success", "message": f"Folder {folder_id} deleted successfully"}
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        logger.error(f"Error deleting folder: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/folders/{folder_id}/documents/{document_id}")
+@telemetry.track(operation_type="add_document_to_folder", metadata_resolver=telemetry.add_document_to_folder_metadata)
 async def add_document_to_folder(
     folder_id: str,
     document_id: str,
@@ -1534,26 +1709,21 @@ async def add_document_to_folder(
         Success status
     """
     try:
-        async with telemetry.track_operation(
-            operation_type="add_document_to_folder",
-            user_id=auth.entity_id,
-            metadata={
-                "folder_id": folder_id,
-                "document_id": document_id,
-            },
-        ):
-            success = await document_service.db.add_document_to_folder(folder_id, document_id, auth)
+        success = await document_service.db.add_document_to_folder(folder_id, document_id, auth)
 
-            if not success:
-                raise HTTPException(status_code=500, detail="Failed to add document to folder")
+        if not success:
+            raise HTTPException(status_code=500, detail="Failed to add document to folder")
 
-            return {"status": "success"}
+        return {"status": "success"}
     except Exception as e:
         logger.error(f"Error adding document to folder: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.delete("/folders/{folder_id}/documents/{document_id}")
+@telemetry.track(
+    operation_type="remove_document_from_folder", metadata_resolver=telemetry.remove_document_from_folder_metadata
+)
 async def remove_document_from_folder(
     folder_id: str,
     document_id: str,
@@ -1571,20 +1741,12 @@ async def remove_document_from_folder(
         Success status
     """
     try:
-        async with telemetry.track_operation(
-            operation_type="remove_document_from_folder",
-            user_id=auth.entity_id,
-            metadata={
-                "folder_id": folder_id,
-                "document_id": document_id,
-            },
-        ):
-            success = await document_service.db.remove_document_from_folder(folder_id, document_id, auth)
+        success = await document_service.db.remove_document_from_folder(folder_id, document_id, auth)
 
-            if not success:
-                raise HTTPException(status_code=500, detail="Failed to remove document from folder")
+        if not success:
+            raise HTTPException(status_code=500, detail="Failed to remove document from folder")
 
-            return {"status": "success"}
+        return {"status": "success"}
     except Exception as e:
         logger.error(f"Error removing document from folder: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -1595,7 +1757,7 @@ async def remove_document_from_folder(
 async def get_graph(
     name: str,
     auth: AuthContext = Depends(verify_token),
-    folder_name: Optional[str] = None,
+    folder_name: Optional[Union[str, List[str]]] = None,
     end_user_id: Optional[str] = None,
 ) -> Graph:
     """
@@ -1634,7 +1796,7 @@ async def get_graph(
 @telemetry.track(operation_type="list_graphs", metadata_resolver=telemetry.list_graphs_metadata)
 async def list_graphs(
     auth: AuthContext = Depends(verify_token),
-    folder_name: Optional[str] = None,
+    folder_name: Optional[Union[str, List[str]]] = None,
     end_user_id: Optional[str] = None,
 ) -> List[Graph]:
     """
@@ -2008,7 +2170,8 @@ async def set_folder_rule(
                                     )
 
                                     # Update document in database
-                                    success = await document_service.db.update_document(doc.external_id, updates, auth)
+                                    app_db = document_service.db
+                                    success = await app_db.update_document(doc.external_id, updates, auth)
 
                                     if success:
                                         logger.info(f"Updated metadata for document {doc.external_id}")

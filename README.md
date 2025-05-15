@@ -37,17 +37,17 @@ The best part? Morphik has a [free tier](https://www.morphik.ai/pricing) and is 
 
 ## Getting Started with Morphik (Recommended)
 
-The fastest and easiest way to get started with Morphik is by signing up for free at [Morphik](https://www.morphik.ai/signup). Your first 200 pages and 100 queries are on us! After this, you can pay based on usage with discounted rates for heavier use.
+The fastest and easiest way to get started with Morphik is by signing up for free at [Morphik](https://www.morphik.ai/signup). We have a generous free tier and transparent, compute-usage based pricing if you're looking to ingest a lot of data.
 
 ## Self-hosting the open-source version
 
 If you'd like to self-host Morphik, you can find the dedicated instruction [here](https://docs.morphik.ai/getting-started). We offer options for direct installation and installation via docker.
 
-**Important**: Due to limited resources, we cannot provide full support for open-source deployments. We have an installation guide, and a [Discord community](https://discord.gg/BwMtv3Zaju) to help, but we can't guarantee full support.  
+**Important**: Due to limited resources, we cannot provide full support for open-source deployments. We have an installation guide, and a [Discord community](https://discord.gg/BwMtv3Zaju) to help, but we can't guarantee full support.
 
 ## Using Morphik
 
-Once you've signed up for Morphik, you can get started with ingesting and search your data right away. 
+Once you've signed up for Morphik, you can get started with ingesting and search your data right away.
 
 
 ### Code (Example: Python SDK)
@@ -85,7 +85,7 @@ Currently, we're focused on improving speed, integrating with more tools, and fi
 
 ## Open source vs paid
 
-Certain features - such as Morphik Console - are not available in the open-source version. Any feature in the `ee` namespace is not available in the open-source version and carries a different license. Any feature outside that is open source under the MIT expat license. 
+Certain features - such as Morphik Console - are not available in the open-source version. Any feature in the `ee` namespace is not available in the open-source version and carries a different license. Any feature outside that is open source under the MIT expat license.
 
 ## Contributors
 
