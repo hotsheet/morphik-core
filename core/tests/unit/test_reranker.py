@@ -140,7 +140,7 @@ async def test_reranker_empty_and_edge_cases(reranker, sample_chunks):
     single_chunk = DocumentChunk(
         document_id="1",
         content="Test content",
-        embedding=[0.1] * 1536,
+        embedding=[0.1] * 768,
         chunk_number=1,
         score=0.5,
     )

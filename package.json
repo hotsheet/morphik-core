@@ -1,9 +1,0 @@
-{
-  "name": "morphik-core",
-  "scripts": {
-    "dev": "docker-compose up --build",
-    "logs": "docker-compose logs -f"
-  },
-  "author": "",
-  "license": "ISC"
-}
