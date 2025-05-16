@@ -319,24 +319,15 @@ const DocumentsSection: React.FC<DocumentsSectionProps> = ({
       // Wrap the async operation
       const fetchWrapper = async () => {
         // Explicitly set loading true *before* the async call within this effect's scope
-        // Note: fetchDocuments might also set this, but we ensure it's set here.
         setLoading(true);
         try {
           await fetchDocuments(effectSource);
-          // If fetchDocuments completes successfully, it will set loading = false in its finally block.
-          // No need to set it here again in the try block.
           console.log(`Effect (${effectSource}): fetchDocuments call completed.`);
         } catch (error) {
-          // Catch potential errors *from* the await fetchDocuments call itself, though
-          // fetchDocuments has internal handling. This is an extra safeguard.
           console.error(`Effect (${effectSource}): Error occurred during fetchDocuments call:`, error);
           showAlert(`Error updating documents: ${error instanceof Error ? error.message : 'Unknown error'}`, { type: 'error' });
-          // Ensure loading is turned off even if fetchDocuments had an issue before its finally.
           setLoading(false);
         } finally {
-          // **User Request:** Explicitly set loading to false within the effect's finally block.
-          // This acts as a safeguard, ensuring loading is false after the attempt,
-          // regardless of fetchDocuments' internal state management.
           console.log(`Effect (${effectSource}): Finally block reached, ensuring loading is false.`);
           setLoading(false);
           isInitialMount.current = false; // Mark initial mount as complete here
@@ -350,7 +341,7 @@ const DocumentsSection: React.FC<DocumentsSectionProps> = ({
        setLoading(false); // Fallback
     }
 
-  }, [foldersLoading, folders, selectedFolder, fetchDocuments, initialFolder]); // Keep fetchDocuments dependency
+  }, [foldersLoading, folders, selectedFolder, fetchDocuments, initialFolder]); // Make sure to include all dependencies
 
   // Poll for document status if any document is processing *and* user is not viewing details
   useEffect(() => {
