@@ -36,111 +36,12 @@ jobs:
           sudo docker builder prune -a --force
           df -h
 
-      - name: Create config file
+      - name: Copy Docker config
         run: |
-          cat > morphik.toml << 'EOF'
-          [api]
-          host = "0.0.0.0"
-          port = 8000
-          reload = true
-          
-          [auth]
-          jwt_algorithm = "HS256"
-          dev_mode = true  # Enabled by default for easier local development
-          dev_entity_id = "dev_user"  # Default dev user ID
-          dev_entity_type = "developer"  # Default dev entity type
-          dev_permissions = ["read", "write", "admin"]  # Default dev permissions
-          
-          #### Registered models
-          [registered_models]
-          
-          # OpenAI models
-          openai_gpt4 = { model_name = "gpt-4" }
-          openai_gpt4-1 = { model_name = "gpt-4.1" }
-          openai_gpt4o = { model_name = "gpt-4o" }
-          
-          # Embedding models
-          openai_embedding = { model_name = "text-embedding-3-small" }
-          openai_embedding_large = { model_name = "text-embedding-3-large" }
-          
-          #### Component configurations ####
-          
-          [agent]
-          model = "openai_gpt4o"
-          
-          [completion]
-          model = "openai_gpt4-1"
-          default_max_tokens = "1000"
-          default_temperature = 0.5
-          
-          [document_analysis]
-          model = "openai_gpt4-1"
-          
-          [database]
-          provider = "postgres"
-          # Connection pool settings
-          pool_size = 10           # Maximum number of connections in the pool
-          max_overflow = 15        # Maximum number of connections that can be created beyond pool_size
-          pool_recycle = 3600      # Time in seconds after which a connection is recycled (1 hour)
-          pool_timeout = 10        # Seconds to wait for a connection from the pool
-          pool_pre_ping = true     # Check connection viability before using it from the pool
-          max_retries = 3          # Number of retries for database operations
-          retry_delay = 1.0        # Initial delay between retries in seconds
-          
-          [embedding]
-          model = "openai_embedding"  # Reference to registered model
-          dimensions = 1536
-          similarity_metric = "cosine"
-          
-          [parser]
-          chunk_size = 6000
-          chunk_overlap = 300
-          use_unstructured_api = false
-          use_contextual_chunking = false
-          contextual_chunking_model = "openai_gpt4-1"  # Reference to a key in registered_models
-          
-          [parser.vision]
-          model = "openai_gpt4-1"  # Reference to a key in registered_models
-          frame_sample_rate = -1  # Set to -1 to disable frame captioning
-          
-          [reranker]
-          use_reranker = true
-          provider = "flag"
-          model_name = "BAAI/bge-reranker-large"
-          query_max_length = 256
-          passage_max_length = 512
-          use_fp16 = true
-          device = "cpu" # use "cpu" if on docker and using a mac, "cuda" if cuda enabled device
-          
-          [storage]
-          provider = "local"
-          storage_path = "./storage"
-          
-          # [storage]
-          # provider = "aws-s3"
-          # region = "us-east-2"
-          # bucket_name = "morphik-s3-storage"
-          
-          [vector_store]
-          provider = "pgvector"
-          
-          [rules]
-          model = "openai_gpt4-1"
-          batch_size = 4096
-          
-          [morphik]
-          enable_colpali = true
-          mode = "self_hosted"  # "cloud" or "self_hosted"
-          api_domain = "api.morphik.ai"  # API domain for cloud URIs
-          
-          [redis]
-          host = "redis"  # use "redis" for docker
-          port = 6379
-          
-          [graph]
-          model = "openai_gpt4-1"
-          enable_entity_resolution = true
-          EOF
+          echo "Using centralized Docker config from .github/config/morphik.toml"
+          cp .github/config/morphik.toml morphik.toml
+          echo "Config file updated:"
+          head -10 morphik.toml
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3

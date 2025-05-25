@@ -1,0 +1,88 @@
+[api]
+host = "0.0.0.0"
+port = 8000
+reload = true
+
+[auth]
+jwt_algorithm = "HS256"
+dev_mode = true
+dev_entity_id = "dev_user"
+dev_entity_type = "developer"
+dev_permissions = ["read", "write", "admin"]
+
+[registered_models]
+openai_gpt4 = { model_name = "gpt-4" }
+openai_gpt4-1 = { model_name = "gpt-4.1" }
+openai_gpt4o = { model_name = "gpt-4o" }
+openai_embedding = { model_name = "text-embedding-3-small" }
+openai_embedding_large = { model_name = "text-embedding-3-large" }
+
+[agent]
+model = "openai_gpt4-1"
+
+[completion]
+model = "openai_gpt4o"
+default_max_tokens = "1000"
+default_temperature = 0.5
+
+[document_analysis]
+model = "openai_gpt4-1"
+
+[database]
+provider = "postgres"
+pool_size = 10
+max_overflow = 15
+pool_recycle = 3600
+pool_timeout = 10
+pool_pre_ping = true
+max_retries = 3
+retry_delay = 1.0
+
+[embedding]
+model = "openai_embedding"
+dimensions = 1536
+similarity_metric = "cosine"
+
+[parser]
+chunk_size = 6000
+chunk_overlap = 300
+use_unstructured_api = false
+use_contextual_chunking = false
+contextual_chunking_model = "openai_gpt4-1"
+
+[parser.vision]
+model = "openai_gpt4-1"
+frame_sample_rate = -1
+
+[reranker]
+use_reranker = true
+provider = "flag"
+model_name = "BAAI/bge-reranker-large"
+query_max_length = 256
+passage_max_length = 512
+use_fp16 = true
+device = "cpu"
+
+[storage]
+provider = "local"
+storage_path = "./storage"
+
+[vector_store]
+provider = "pgvector"
+
+[rules]
+model = "openai_gpt4-1"
+batch_size = 4096
+
+[morphik]
+enable_colpali = true
+mode = "self_hosted"
+api_domain = "api.morphik.ai"
+
+[redis]
+host = "redis"
+port = 6379
+
+[graph]
+model = "openai_gpt4-1"
+enable_entity_resolution = true 
