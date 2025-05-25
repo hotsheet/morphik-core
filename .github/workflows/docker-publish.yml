@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - main
+      # we publish our own config docker image from this branch
+      - feat/issue-158-publish-docker-image
       
 permissions:
   contents: read
