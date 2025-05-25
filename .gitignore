@@ -37,8 +37,10 @@ ee/ui-component/package-lock.json/*
 ee/ui-component/node-modules/*
 ee/ui-component/.next
 
+# ee/ee.toml
+
 
 ui-component/notebook-storage/notebooks.json
 ee/ui-component/package-lock.json
-
-*.log
+ee/ee_tokens/gdrive_token_dev_user.pickle
+core/tests/integration/test_data/version_test_1.txt
