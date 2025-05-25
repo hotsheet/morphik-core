@@ -85,10 +85,10 @@ jobs:
           #### Component configurations ####
           
           [agent]
-          model = "openai_gpt4-1"
+          model = "openai_gpt4o"
           
           [completion]
-          model = "openai_gpt4o"
+          model = "openai_gpt4-1"
           default_max_tokens = "1000"
           default_temperature = 0.5
           
@@ -159,6 +159,7 @@ jobs:
           [graph]
           model = "openai_gpt4-1"
           enable_entity_resolution = true
+          EOF
           
           # Start container in detached mode with config mounted
           CONTAINER_ID=$(docker run -d -p 8000:8000 \
