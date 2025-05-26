@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - main
+      # we publish our own config docker image from this branch
+      - feat/issue-158-publish-docker-image
       
 permissions:
   contents: read
@@ -33,6 +35,13 @@ jobs:
           sudo docker image prune --all --force
           sudo docker builder prune -a --force
           df -h
+
+      - name: Copy Docker config
+        run: |
+          echo "Using centralized Docker config from .github/config/morphik.toml"
+          cp .github/config/morphik.toml morphik.toml
+          echo "Config file updated:"
+          head -10 morphik.toml
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
