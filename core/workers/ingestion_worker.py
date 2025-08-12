@@ -3,7 +3,7 @@ import json
 import logging
 import os
 import urllib.parse as up
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from arq.connections import RedisSettings
@@ -19,6 +19,8 @@ from core.parser.morphik_parser import MorphikParser
 from core.services.document_service import DocumentService
 from core.services.rules_processor import RulesProcessor
 from core.services.telemetry import TelemetryService
+from core.services.antivirus_service import AntivirusService
+from core.services.zip_service import ZipExtractionService
 from core.storage.local_storage import LocalStorage
 from core.storage.s3_storage import S3Storage
 from core.vector_store.multi_vector_store import MultiVectorStore
@@ -82,6 +84,177 @@ async def get_document_with_retry(document_service, document_id, auth, max_retri
     return None
 
 
+async def process_zip_file(
+    ctx: Dict[str, Any],
+    parent_document_id: str,
+    zip_content: bytes,
+    original_filename: str,
+    metadata_json: str,
+    auth_dict: Dict[str, Any],
+    rules_list: List[Dict[str, Any]],
+    use_colpali: bool,
+    folder_name: Optional[str] = None,
+    end_user_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Process a zip file by extracting contents and ingesting each file"""
+    
+    try:
+        logger.info(f"Processing zip file: {original_filename}")
+        
+        antivirus_service = AntivirusService()
+        zip_service = ZipExtractionService()
+        document_service: DocumentService = ctx["document_service"]
+        
+        auth = AuthContext(
+            entity_type=EntityType(auth_dict.get("entity_type", "unknown")),
+            entity_id=auth_dict.get("entity_id", ""),
+            app_id=auth_dict.get("app_id"),
+            permissions=set(auth_dict.get("permissions", ["read"])),
+            user_id=auth_dict.get("user_id", auth_dict.get("entity_id", "")),
+        )
+        
+        is_clean, threat_name = await antivirus_service.scan_file(zip_content, original_filename)
+        if not is_clean:
+            logger.error(f"Zip file {original_filename} failed virus scan: {threat_name}")
+            database = ctx["database"]
+            await database.update_document(
+                document_id=parent_document_id,
+                updates={"system_metadata": {"status": "failed", "error": f"Virus detected: {threat_name}"}},
+                auth=auth,
+            )
+            return {"document_id": parent_document_id, "status": "failed", "error": f"Virus detected: {threat_name}"}
+        
+        extracted_files = await zip_service.extract_zip(zip_content, original_filename)
+        
+        if not extracted_files:
+            logger.warning(f"No files extracted from {original_filename}")
+            return {"document_id": parent_document_id, "status": "completed", "extracted_count": 0}
+        
+        processed_count = 0
+        failed_count = 0
+        
+        for filename, file_content, mime_type in extracted_files:
+            try:
+                is_clean, threat_name = await antivirus_service.scan_file(file_content, filename)
+                if not is_clean:
+                    logger.warning(f"Extracted file {filename} failed virus scan: {threat_name}")
+                    failed_count += 1
+                    continue
+                
+                from core.models.documents import Document
+                import uuid
+                
+                extracted_doc = Document(
+                    content_type=mime_type,
+                    filename=f"{original_filename}/{filename}",
+                    metadata=json.loads(metadata_json) if metadata_json else {},
+                    owner={"type": auth_dict.get("entity_type", "unknown"), "id": auth_dict.get("entity_id", "")},
+                    access_control={
+                        "readers": [auth_dict.get("entity_id", "")],
+                        "writers": [auth_dict.get("entity_id", "")],
+                        "admins": [auth_dict.get("entity_id", "")],
+                        "user_id": [auth_dict.get("user_id", "")] if auth_dict.get("user_id") else [],
+                    },
+                    system_metadata={"status": "processing", "extracted_from": parent_document_id},
+                )
+                
+                database = ctx["database"]
+                success = await database.store_document(extracted_doc)
+                if not success:
+                    logger.error(f"Failed to store extracted document for {filename}")
+                    failed_count += 1
+                    continue
+                
+                file_key = f"ingest_uploads/{uuid.uuid4()}/{filename}"
+                import base64
+                from datetime import datetime, timezone
+                from core.models.documents import StorageFileInfo
+                
+                file_content_base64 = base64.b64encode(file_content).decode()
+                bucket, stored_key = await document_service.storage.upload_from_base64(
+                    file_content_base64, file_key, mime_type
+                )
+                
+                extracted_doc.storage_info = {"bucket": bucket, "key": stored_key}
+                
+                initial_file_info = StorageFileInfo(
+                    bucket=bucket,
+                    key=stored_key,
+                    version=1,
+                    filename=filename,
+                    content_type=mime_type,
+                    timestamp=datetime.now(timezone.utc),
+                )
+                extracted_doc.storage_files = [initial_file_info]
+                
+                await database.update_document(
+                    document_id=extracted_doc.external_id,
+                    updates={"storage_info": extracted_doc.storage_info, "storage_files": extracted_doc.storage_files},
+                    auth=auth,
+                )
+                
+                redis = ctx.get("redis")
+                if redis:
+                    job = await redis.enqueue_job(
+                        "process_ingestion_job",
+                        document_id=extracted_doc.external_id,
+                        file_key=stored_key,
+                        bucket=bucket,
+                        original_filename=filename,
+                        content_type=mime_type,
+                        metadata_json=metadata_json,
+                        auth_dict=auth_dict,
+                        rules_list=rules_list,
+                        use_colpali=use_colpali,
+                        folder_name=folder_name,
+                        end_user_id=end_user_id,
+                    )
+                    logger.info(f"Queued processing job for extracted file {filename}: {job.job_id}")
+                
+                processed_count += 1
+                
+            except Exception as e:
+                logger.error(f"Error processing extracted file {filename}: {e}")
+                failed_count += 1
+                continue
+        
+        database = ctx["database"]
+        await database.update_document(
+            document_id=parent_document_id,
+            updates={
+                "system_metadata": {
+                    "status": "completed",
+                    "extracted_count": processed_count,
+                    "failed_count": failed_count,
+                    "zip_processed": True
+                }
+            },
+            auth=auth,
+        )
+        
+        logger.info(f"Completed zip processing: {processed_count} files processed, {failed_count} failed")
+        return {
+            "document_id": parent_document_id,
+            "status": "completed",
+            "extracted_count": processed_count,
+            "failed_count": failed_count
+        }
+        
+    except Exception as e:
+        logger.error(f"Error processing zip file {original_filename}: {e}")
+        try:
+            database = ctx["database"]
+            await database.update_document(
+                document_id=parent_document_id,
+                updates={"system_metadata": {"status": "failed", "error": str(e)}},
+                auth=auth,
+            )
+        except Exception as update_error:
+            logger.error(f"Failed to update document status: {update_error}")
+        
+        return {"document_id": parent_document_id, "status": "failed", "error": str(e)}
+
+
 async def process_ingestion_job(
     ctx: Dict[str, Any],
     document_id: str,
@@ -139,6 +312,12 @@ async def process_ingestion_job(
         # Ensure file_content is bytes
         if hasattr(file_content, "read"):
             file_content = file_content.read()
+
+        if content_type == "application/zip" or original_filename.lower().endswith('.zip'):
+            return await process_zip_file(
+                ctx, document_id, file_content, original_filename, metadata_json, 
+                auth_dict, rules_list, use_colpali, folder_name, end_user_id
+            )
 
         # 4. Parse file to text
         additional_metadata, text = await document_service.parser.parse_file_to_text(file_content, original_filename)

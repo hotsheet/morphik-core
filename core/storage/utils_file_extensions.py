@@ -41,5 +41,6 @@ def detect_file_type(content: str) -> str:
         "text/plain": ".txt",
         "application/msword": ".doc",
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+        "application/zip": ".zip",
     }
     return extension_map.get(kind.mime, ".bin")
